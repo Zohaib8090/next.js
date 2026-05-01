@@ -2,7 +2,6 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, hash_map::Entry},
     fmt::Display,
-    sync::Arc,
 };
 
 use anyhow::{Context, Result};
@@ -19,6 +18,7 @@ use swc_core::{
         visit::{Visit, VisitWith},
     },
 };
+use triomphe::Arc;
 use turbo_frozenmap::FrozenMap;
 use turbo_rcstr::{RcStr, rcstr};
 use turbo_tasks::{FxIndexMap, FxIndexSet, ResolvedVc};

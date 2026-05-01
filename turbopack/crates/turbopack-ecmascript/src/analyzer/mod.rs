@@ -5,7 +5,6 @@ use std::{
     fmt::{self, Display, Formatter, Write},
     hash::{BuildHasherDefault, Hash, Hasher},
     mem::take,
-    sync::Arc,
 };
 
 use anyhow::{Result, bail};
@@ -23,6 +22,12 @@ use swc_core::{
         atoms::Atom,
     },
 };
+// `triomphe::Arc` (a.k.a. `Arc` here) drops the weak refcount: the header is
+// `{ refcount: AtomicUsize }` (8 bytes) instead of `std`'s
+// `{ strong: AtomicUsize, weak: AtomicUsize }` (16 bytes). For deeply nested
+// `JsValue` trees this halves the per-allocation header overhead and skips the
+// second atomic op on drop.
+use triomphe::Arc;
 use turbo_esregex::EsRegex;
 use turbo_rcstr::{RcStr, rcstr};
 use turbo_tasks::{FxIndexMap, FxIndexSet, Vc};
