@@ -3431,18 +3431,18 @@ async fn value_visitor_inner(
         return Ok(((&*value).try_into()?, true));
     }
     let value = match v {
-        JsValue::Call(_, list)
+        JsValue::Call(_, call)
             if matches!(
-                list.callee(),
+                call.callee(),
                 JsValue::WellKnownFunction(WellKnownFunctionKind::RequireResolve)
             ) =>
         {
-            let (_, args) = list.into_parts();
+            let (_, args) = call.into_parts();
             require_resolve_visitor(origin, args).await?
         }
-        JsValue::Call(_, ref list)
+        JsValue::Call(_, ref call)
             if matches!(
-                list.callee(),
+                call.callee(),
                 JsValue::WellKnownFunction(WellKnownFunctionKind::ImportMetaGlob)
             ) =>
         {
@@ -3450,18 +3450,18 @@ async fn value_visitor_inner(
             // in value_visitor_inner we just return unknown.
             v.into_unknown(false, rcstr!("import.meta.glob()"))
         }
-        JsValue::Call(_, list)
+        JsValue::Call(_, call)
             if matches!(
-                list.callee(),
+                call.callee(),
                 JsValue::WellKnownFunction(WellKnownFunctionKind::RequireContext)
             ) =>
         {
-            let (_, args) = list.into_parts();
+            let (_, args) = call.into_parts();
             require_context_visitor(origin, args).await?
         }
-        JsValue::Call(_, ref list)
+        JsValue::Call(_, ref call)
             if matches!(
-                list.callee(),
+                call.callee(),
                 JsValue::WellKnownFunction(
                     WellKnownFunctionKind::RequireContextRequire(..)
                         | WellKnownFunctionKind::RequireContextRequireKeys(..)
@@ -3476,9 +3476,9 @@ async fn value_visitor_inner(
                 rcstr!("require.context() static analysis is currently limited"),
             )
         }
-        JsValue::Call(_, ref list)
+        JsValue::Call(_, ref call)
             if matches!(
-                list.callee(),
+                call.callee(),
                 JsValue::WellKnownFunction(WellKnownFunctionKind::CreateRequire)
             ) =>
         {
@@ -3488,12 +3488,12 @@ async fn value_visitor_inner(
                     box JsValue::WellKnownObject(WellKnownObjectKind::ImportMeta),
                     box JsValue::Constant(super::analyzer::ConstantValue::Str(prop)),
                 ),
-            ] = list.args()
+            ] = call.args()
                 && prop.as_str() == "url"
             {
                 // `createRequire(import.meta.url)`
                 JsValue::WellKnownFunction(WellKnownFunctionKind::Require)
-            } else if let [JsValue::Url(rel, JsValueUrlKind::Relative)] = list.args() {
+            } else if let [JsValue::Url(rel, JsValueUrlKind::Relative)] = call.args() {
                 // `createRequire(new URL("<rel>", import.meta.url))`
                 JsValue::WellKnownFunction(WellKnownFunctionKind::RequireFrom(Box::new(
                     rel.clone(),
@@ -3502,9 +3502,9 @@ async fn value_visitor_inner(
                 v.into_unknown(true, rcstr!("createRequire() non constant"))
             }
         }
-        JsValue::New(_, ref list)
+        JsValue::New(_, ref call)
             if matches!(
-                list.callee(),
+                call.callee(),
                 JsValue::WellKnownFunction(WellKnownFunctionKind::URLConstructor)
             ) =>
         {
@@ -3515,7 +3515,7 @@ async fn value_visitor_inner(
                     box JsValue::WellKnownObject(WellKnownObjectKind::ImportMeta),
                     box JsValue::Constant(super::analyzer::ConstantValue::Str(prop)),
                 ),
-            ] = list.args()
+            ] = call.args()
             {
                 if prop.as_str() == "url" {
                     JsValue::Url(url.clone(), JsValueUrlKind::Relative)
