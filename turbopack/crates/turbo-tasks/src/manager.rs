@@ -16,7 +16,6 @@ use anyhow::{Result, anyhow};
 use auto_hash_map::AutoMap;
 use bincode::{Decode, Encode};
 use either::Either;
-use futures::stream::FuturesUnordered;
 use rustc_hash::{FxBuildHasher, FxHasher};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -38,9 +37,10 @@ use crate::{
     id::{ExecutionId, LocalTaskId, TRANSIENT_TASK_BIT, TraitTypeId},
     id_factory::IdFactoryWithReuse,
     keyed::KeyedEq,
+    local_task_tracker::LocalTaskTracker,
     macro_helpers::NativeFunction,
     message_queue::{CompilationEvent, CompilationEventQueue},
-    priority_runner::{Executor, JoinHandle, PriorityRunner},
+    priority_runner::{Executor, PriorityRunner},
     raw_vc::{CellId, RawVc},
     registry,
     serialization_invalidation::SerializationInvalidator,
@@ -495,10 +495,6 @@ pub struct TurboTasks<B: Backend + 'static> {
     compilation_events: CompilationEventQueue,
 }
 
-type LocalTaskTracker = Option<
-    FuturesUnordered<Either<JoinHandle, Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>>>,
->;
-
 /// Information about a non-local task. A non-local task can contain multiple "local" tasks, which
 /// all share the same non-local task state.
 ///
@@ -530,12 +526,10 @@ struct CurrentTaskState {
     /// This is taken (and becomes `None`) during teardown of a task.
     cell_counters: Option<AutoMap<ValueTypeId, u32, BuildHasherDefault<FxHasher>, 8>>,
 
-    /// Local tasks created while this global task has been running. Indexed by `LocalTaskId`.
-    local_tasks: Vec<LocalTask>,
-
-    /// Tracks currently running local tasks, and defers cleanup of the global task until those
-    /// complete. Also used by `spawn_detached_for_testing`.
-    local_task_tracker: LocalTaskTracker,
+    /// Local tasks (and detached test futures) created during this global task's execution.
+    /// Bundles the slot vector, the in-flight counter, and the wait-group event under one
+    /// abstraction; see [`LocalTaskTracker`].
+    local_tasks: LocalTaskTracker,
 }
 
 impl CurrentTaskState {
@@ -554,8 +548,7 @@ impl CurrentTaskState {
             has_invalidator: false,
             in_top_level_task,
             cell_counters: Some(AutoMap::default()),
-            local_tasks: Vec::new(),
-            local_task_tracker: None,
+            local_tasks: LocalTaskTracker::new(),
         }
     }
 
@@ -573,8 +566,7 @@ impl CurrentTaskState {
             has_invalidator: false,
             in_top_level_task,
             cell_counters: None,
-            local_tasks: Vec::new(),
-            local_task_tracker: None,
+            local_tasks: LocalTaskTracker::new(),
         }
     }
 
@@ -585,25 +577,6 @@ impl CurrentTaskState {
                  parent task that created them"
             );
         }
-    }
-
-    fn create_local_task(&mut self, local_task: LocalTask) -> LocalTaskId {
-        self.local_tasks.push(local_task);
-        // generate a one-indexed id from len() -- we just pushed so len() is >= 1
-        if cfg!(debug_assertions) {
-            LocalTaskId::try_from(u32::try_from(self.local_tasks.len()).unwrap()).unwrap()
-        } else {
-            unsafe { LocalTaskId::new_unchecked(self.local_tasks.len() as u32) }
-        }
-    }
-
-    fn get_local_task(&self, local_task_id: LocalTaskId) -> &LocalTask {
-        // local task ids are one-indexed (they use NonZeroU32)
-        &self.local_tasks[(*local_task_id as usize) - 1]
-    }
-
-    fn get_mut_local_task(&mut self, local_task_id: LocalTaskId) -> &mut LocalTask {
-        &mut self.local_tasks[(*local_task_id as usize) - 1]
     }
 }
 
@@ -882,7 +855,9 @@ impl<B: Backend + 'static> TurboTasks<B> {
         let (global_task_state, execution_id, priority, local_task_id) =
             CURRENT_TASK_STATE.with(|gts| {
                 let mut gts_write = gts.write().unwrap();
-                let local_task_id = gts_write.create_local_task(LocalTask::Scheduled {
+                // `create` pushes the task into the slot vector AND increments the in-flight
+                // counter on the same lock acquisition.
+                let local_task_id = gts_write.local_tasks.create(LocalTask::Scheduled {
                     done_event: Event::new(move || {
                         move || format!("LocalTask({task_type})::done_event")
                     }),
@@ -895,23 +870,17 @@ impl<B: Backend + 'static> TurboTasks<B> {
                 )
             });
 
-        let future = self.priority_runner.schedule_with_join_handle(
+        self.priority_runner.schedule(
             &self.pin(),
             ScheduledTask::LocalTask {
                 ty,
                 persistence,
                 local_task_id,
-                global_task_state: global_task_state.clone(),
+                global_task_state,
                 span: Span::current(),
             },
             priority,
         );
-        global_task_state
-            .write()
-            .unwrap()
-            .local_task_tracker
-            .get_or_insert_default()
-            .push(Either::Left(future));
 
         RawVc::LocalOutput(execution_id, local_task_id, persistence)
     }
@@ -1316,20 +1285,13 @@ impl<B: Backend> Executor<TurboTasks<B>, ScheduledTask, TaskPriority> for TurboT
                             ),
                         };
 
-                        let local_task = LocalTask::Done { output };
-
                         let done_event = CURRENT_TASK_STATE.with(move |gts| {
-                            let mut gts_write = gts.write().unwrap();
-                            let scheduled_task = std::mem::replace(
-                                gts_write.get_mut_local_task(local_task_id),
-                                local_task,
-                            );
-                            let LocalTask::Scheduled { done_event } = scheduled_task else {
-                                panic!("local task finished, but was not in the scheduled state?");
-                            };
-                            done_event
+                            gts.write()
+                                .unwrap()
+                                .local_tasks
+                                .complete(local_task_id, output)
                         });
-                        done_event.notify(usize::MAX)
+                        done_event.notify(usize::MAX);
                     }
                     .instrument(span)
                     .await
@@ -1502,7 +1464,7 @@ impl<B: Backend + 'static> TurboTasksApi for TurboTasks<B> {
             // compile-time checks cannot capture.
             gts_read.assert_execution_id(execution_id);
 
-            match gts_read.get_local_task(local_task_id) {
+            match gts_read.local_tasks.get(local_task_id) {
                 LocalTask::Scheduled { done_event } => Ok(Err(done_event.listen())),
                 LocalTask::Done { output } => Ok(Ok(output.as_read_result()?)),
             }
@@ -1596,17 +1558,21 @@ impl<B: Backend + 'static> TurboTasksApi for TurboTasks<B> {
         // this is similar to what happens for a local task, except that we keep the local task's
         // state as well.
         let global_task_state = CURRENT_TASK_STATE.with(|ts| ts.clone());
-        let fut = tokio::spawn(TURBO_TASKS.scope(
+        global_task_state
+            .write()
+            .unwrap()
+            .local_tasks
+            .register_detached();
+        let wrapped = async move {
+            fut.await;
+            // Pair for `register_detached`. Tasks panic-aborting upstream means we don't need
+            // RAII guard semantics here; if `fut` panics, the process aborts before this dec.
+            CURRENT_TASK_STATE.with(|ts| ts.write().unwrap().local_tasks.dec_in_flight());
+        };
+        tokio::spawn(TURBO_TASKS.scope(
             turbo_tasks(),
-            CURRENT_TASK_STATE.scope(global_task_state.clone(), fut),
+            CURRENT_TASK_STATE.scope(global_task_state, wrapped),
         ));
-        let fut = Box::pin(async move {
-            fut.await.unwrap();
-        });
-        let mut ts = global_task_state.write().unwrap();
-        ts.local_task_tracker
-            .get_or_insert_default()
-            .push(Either::Right(fut));
     }
 
     fn task_statistics(&self) -> &TaskStatisticsApi {
@@ -1697,12 +1663,30 @@ impl<B: Backend + 'static> TurboTasksBackendApi<B> for TurboTasks<B> {
 }
 
 async fn wait_for_local_tasks() {
-    // This needs to be a while loop in case one local task completing/exeucting triggers another.
-    while let Some(mut ltt) =
-        CURRENT_TASK_STATE.with(|ts| ts.write().unwrap().local_task_tracker.take())
-    {
-        use futures::StreamExt;
-        while ltt.next().await.is_some() {}
+    // Standard double-check pattern: take a listener, re-check the counter, then await.
+    // If a notify fires between the first read and the listen, the second read sees zero and
+    // returns. If we got past the second read while still in flight, the next decrement to
+    // zero notifies us via the listener.
+    loop {
+        // Snapshot in_flight under a read lock; if zero we're done. Cheap path.
+        let listener = CURRENT_TASK_STATE.with(|ts| {
+            let tracker = &ts.read().unwrap().local_tasks;
+            if tracker.in_flight() == 0 {
+                None
+            } else {
+                Some(tracker.listen())
+            }
+        });
+        let Some(listener) = listener else {
+            return;
+        };
+        // Re-check after registering the listener.
+        let still_in_flight =
+            CURRENT_TASK_STATE.with(|ts| ts.read().unwrap().local_tasks.in_flight());
+        if still_in_flight == 0 {
+            return;
+        }
+        listener.await;
     }
 }
 
