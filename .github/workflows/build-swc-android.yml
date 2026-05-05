@@ -24,6 +24,9 @@ jobs:
         with:
           targets: aarch64-linux-android
 
+      - name: Install Rust target
+        run: rustup target add aarch64-linux-android
+
       - name: Setup Android NDK
         run: |
           echo "ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
