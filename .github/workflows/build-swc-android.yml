@@ -43,7 +43,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
-          npm install -g @napi-rs/cli
+          # Pin to the version Next.js 16.1.6 uses
+          npm install -g @napi-rs/cli@2.18.4
 
       - name: Build next-swc-napi
         env:
@@ -54,19 +55,22 @@ jobs:
           BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android: "--sysroot=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
         run: |
           cd packages/next-swc
-          npx napi build \
+          # Using the exact flags from Next.js 16.1.6 build scripts
+          napi build \
             --release \
             --target aarch64-linux-android \
             -p next-swc-napi \
-            --features image-extended \
-            --js false \
+            --cargo-cwd ../../ \
             --cargo-name next_swc_napi \
-            --cargo-cwd ../../
+            --features plugin,image-extended,tracing/release_max_level_trace \
+            --js false \
+            native
 
       - name: Prepare Artifact
         run: |
           mkdir -p output
-          cp packages/next-swc/*.node output/next-swc.android-arm64.node
+          # The 'native' argument above puts the file in packages/next-swc/native/
+          cp packages/next-swc/native/*.node output/next-swc.android-arm64.node
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
