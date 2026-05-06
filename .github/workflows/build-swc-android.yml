@@ -24,8 +24,12 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android
+        # We don't specify targets here because the repo override will ignore it
+
+      - name: Install Android Target to Active Toolchain
+        run: |
+          # This adds the target to the toolchain specified in Next.js's rust-toolchain.toml
+          rustup target add aarch64-linux-android
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
@@ -43,7 +47,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
-          # Pin to the version Next.js 16.1.6 uses
           npm install -g @napi-rs/cli@2.18.4
 
       - name: Build next-swc-napi
@@ -55,7 +58,6 @@ jobs:
           BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android: "--sysroot=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
         run: |
           cd packages/next-swc
-          # Using the exact flags from Next.js 16.1.6 build scripts
           napi build \
             --release \
             --target aarch64-linux-android \
@@ -69,7 +71,6 @@ jobs:
       - name: Prepare Artifact
         run: |
           mkdir -p output
-          # The 'native' argument above puts the file in packages/next-swc/native/
           cp packages/next-swc/native/*.node output/next-swc.android-arm64.node
 
       - name: Upload Artifact
