@@ -1,60 +1,19 @@
-name: Build SWC for Android ARM64 (NAPI 10)
-
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - android-swc-build
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      # CRITICAL: Target NAPI 10 to match Node v25 and avoid segmentation faults
-      NAPI_VERSION: 10
-      RUST_BACKTRACE: 1
-
-    steps:
-      - name: Checkout Next.js
-        uses: actions/checkout@v4
-        with:
-          repository: vercel/next.js
-          ref: v16.1.6
-          fetch-depth: 0
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android
-
-      - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r27
-          add-to-path: true
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22 # Use a stable LTS for the build runner
-
-      - name: Install @napi-rs/cli
-        run: npm install -g @napi-rs/cli
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Build next-swc-napi
         env:
-          # Toolchain configuration for Rust cross-compilation
           CC_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
           CXX_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++
           AR_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
+          # Add this to ensure Rust knows where the sysroot is
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android: "--sysroot=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
         run: |
-          # Use napi build to handle the NAPI glue code and release optimizations
-          # Building from packages/next-swc ensures we use the correct local workspace context
           cd packages/next-swc
-          napi build \
+          npx napi build \
             --release \
             --target aarch64-linux-android \
             -p next-swc-napi \
@@ -62,17 +21,3 @@ jobs:
             --js false \
             --cargo-name next_swc_napi \
             --cargo-cwd ../../
-
-      - name: Prepare Artifact
-        run: |
-          mkdir -p output
-          # napi build places the .node file in packages/next-swc/
-          # We rename it to the exact filename Next.js expects for Android ARM64
-          cp packages/next-swc/next-swc-napi.android-arm64.node output/next-swc.android-arm64.node
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: next-swc-android-arm64-napi10
-          path: output/next-swc.android-arm64.node
-          if-no-files-found: error
