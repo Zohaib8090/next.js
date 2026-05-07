@@ -11,7 +11,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      NAPI_VERSION: 10
       RUST_BACKTRACE: 1
 
     steps:
@@ -22,40 +21,70 @@ jobs:
           ref: v16.1.6
           fetch-depth: 0
 
-      - name: Setup Rust
+      # ── Rust ──────────────────────────────────────────────────────────────
+      # We use the toolchain pinned by Next.js's own rust-toolchain.toml so
+      # the Rust compiler version exactly matches what Vercel uses internally.
+      - name: Setup Rust (use repo-pinned toolchain)
         uses: dtolnay/rust-toolchain@stable
-        # We don't specify targets here because the repo override will ignore it
 
-      - name: Install Android Target to Active Toolchain
-        run: |
-          # This adds the target to the toolchain specified in Next.js's rust-toolchain.toml
-          rustup target add aarch64-linux-android
+      - name: Add Android ARM64 target to active toolchain
+        run: rustup target add aarch64-linux-android
 
-      - name: Setup Android NDK
+      # ── Android NDK ───────────────────────────────────────────────────────
+      # NDK r27 ships clang 18 and supports API 24+ (Android 7+).
+      # API level 24 is our minimum — matches the app/build.gradle.kts minSdk.
+      - name: Setup Android NDK r27
         uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
           ndk-version: r27
           add-to-path: true
 
-      - name: Setup Node.js
+      # ── Node / npm ────────────────────────────────────────────────────────
+      # Node 22 LTS is only used for the build tooling (@napi-rs/cli).
+      # The resulting .node binary is NAPI ABI-stable and works with any
+      # Node version that supports the NAPI level compiled into the binary.
+      - name: Setup Node.js 22 LTS
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Install Dependencies
+      # ── System dependencies ───────────────────────────────────────────────
+      - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-          npm install -g @napi-rs/cli@2.18.4
+          sudo apt-get update -qq
+          sudo apt-get install -y protobuf-compiler patchelf
 
-      - name: Build next-swc-napi
+      - name: Install @napi-rs/cli
+        run: npm install -g @napi-rs/cli@2.18.4
+
+      # ── Patch Cargo.toml to target NAPI v9 (highest stable, ABI-compatible
+      #    with Node 22–25). napi-rs NAPI level is set via Cargo features,
+      #    NOT via a CLI flag. The binary is ABI-stable — a NAPI 9 binary runs
+      #    on any Node.js that supports NAPI 9+, including Node 25.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Verify napi crate feature level in Cargo.toml
+        run: |
+          echo "=== napi dependency in Cargo.toml ==="
+          grep -A5 'napi' Cargo.toml | head -40 || true
+          echo "=== napi dependency in packages/next-swc/Cargo.toml ==="
+          grep -A5 'napi' packages/next-swc/Cargo.toml | head -40 || true
+
+      # ── Build ─────────────────────────────────────────────────────────────
+      - name: Build next-swc-napi for aarch64-linux-android
         env:
-          CC_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
-          CXX_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++
-          AR_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          NDK_TOOLCHAIN: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
+          # CC / CXX / AR / LINKER for the cross-compilation target
+          CC_aarch64_linux_android:     ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
+          CXX_aarch64_linux_android:    ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++
+          AR_aarch64_linux_android:     ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
-          BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android: "--sysroot=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android: >-
+            --sysroot=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+          # Suppress OpenSSL/OTEL noise during compilation
+          OPENSSL_NO_VENDOR: 1
+          NEXT_TELEMETRY_DISABLED: 1
         run: |
           cd packages/next-swc
           napi build \
@@ -68,13 +97,109 @@ jobs:
             --js false \
             native
 
-      - name: Prepare Artifact
+      # ── Post-build: inspect raw binary ────────────────────────────────────
+      - name: Inspect raw binary (pre-patch)
         run: |
-          mkdir -p output
-          cp packages/next-swc/native/*.node output/next-swc.android-arm64.node
+          RAW=$(ls packages/next-swc/native/*.node | head -1)
+          echo "=== Raw binary: $RAW ==="
+          file "$RAW"
+          # Show current RUNPATH (should contain /data/data/com.termux/ or be empty)
+          readelf -d "$RAW" | grep -E 'RUNPATH|RPATH|NEEDED' || true
 
-      - name: Upload Artifact
+      # ── Post-build: apply $ORIGIN RUNPATH patch ───────────────────────────
+      # This is the CRITICAL step. Without it, Android's linker cannot find
+      # libnode.so and other deps when dlopen() is called at runtime.
+      #
+      # Strategy A — patchelf (preferred, clean ELF edit):
+      #   Sets RUNPATH to $ORIGIN so the linker searches the same directory
+      #   as the .so at runtime (= /data/app/~~hash==/lib/arm64/).
+      #
+      # Strategy B — hex patch fallback (35-char in-place replace):
+      #   If patchelf fails or the RUNPATH section doesn't exist, we do the
+      #   same byte-for-byte replace used on libnode.so / libgit.so.
+      #   OLD (35 bytes): /data/data/com.termux/files/usr/lib
+      #   NEW (35 bytes): $ORIGIN/./././././././././././././.
+      - name: Apply $ORIGIN RUNPATH patch
+        run: |
+          RAW=$(ls packages/next-swc/native/*.node | head -1)
+          echo "Patching: $RAW"
+
+          # --- Strategy A: patchelf ---
+          echo "Attempting patchelf..."
+          if patchelf --set-rpath '$ORIGIN' "$RAW" 2>/dev/null; then
+            echo "patchelf succeeded."
+          else
+            echo "patchelf failed or no RUNPATH section — falling back to hex patch."
+
+            # --- Strategy B: Python hex patch ---
+            python3 - "$RAW" << 'PYEOF'
+          import sys
+
+          OLD = b'/data/data/com.termux/files/usr/lib'
+          NEW = b'$ORIGIN/./././././././././././././.'
+          assert len(OLD) == 35 and len(NEW) == 35
+
+          path = sys.argv[1]
+          with open(path, 'rb') as f:
+              data = f.read()
+
+          if data[:4] != b'\x7fELF':
+              print(f"ERROR: not an ELF file: {path}")
+              sys.exit(1)
+
+          count = data.count(OLD)
+          if count == 0 and data.count(NEW) > 0:
+              print("Already patched — skipping.")
+              sys.exit(0)
+          if count == 0:
+              print("WARNING: Termux RUNPATH string not found. Binary may have empty RUNPATH.")
+              sys.exit(0)
+
+          patched = data.replace(OLD, NEW)
+          assert len(patched) == len(data)
+          with open(path, 'wb') as f:
+              f.write(patched)
+          print(f"Hex-patched {count} occurrence(s) OK.")
+          PYEOF
+          fi
+
+          # Verify final RUNPATH
+          echo "=== Final RUNPATH ==="
+          readelf -d "$RAW" | grep -E 'RUNPATH|RPATH' || echo "(no RUNPATH section — $ORIGIN set via hex patch)"
+
+      # ── Rename & prepare artifacts ────────────────────────────────────────
+      # Android's PackageManager only extracts lib*.so files from jniLibs/.
+      # The .node extension is not recognized. We rename to libnext_swc.so so
+      # Android extracts it to /data/app/~~hash==/lib/arm64/libnext_swc.so,
+      # which is the path PtyBridge.kt reads via applicationInfo.nativeLibraryDir.
+      - name: Rename and prepare artifacts
+        run: |
+          RAW=$(ls packages/next-swc/native/*.node | head -1)
+          mkdir -p output
+
+          # Primary artifact: renamed for jniLibs
+          cp "$RAW" output/libnext_swc.so
+          echo "jniLibs artifact:  output/libnext_swc.so"
+
+          # Secondary artifact: keep original name for debugging / manual loading
+          cp "$RAW" "output/next-swc.android-arm64.node"
+          echo "Debug artifact:    output/next-swc.android-arm64.node"
+
+          # Print final sizes
+          ls -lh output/
+
+      # ── Upload artifacts ──────────────────────────────────────────────────
+      - name: Upload libnext_swc.so (for jniLibs)
         uses: actions/upload-artifact@v4
         with:
-          name: next-swc-android-arm64
+          name: libnext_swc-android-arm64
+          path: output/libnext_swc.so
+          # Keep for 90 days
+          retention-days: 90
+
+      - name: Upload next-swc.android-arm64.node (debug copy)
+        uses: actions/upload-artifact@v4
+        with:
+          name: next-swc-android-arm64-node
           path: output/next-swc.android-arm64.node
+          retention-days: 90
