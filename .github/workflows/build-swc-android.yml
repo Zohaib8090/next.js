@@ -22,13 +22,24 @@ jobs:
           fetch-depth: 0
 
       # ── Rust ──────────────────────────────────────────────────────────────
-      # We use the toolchain pinned by Next.js's own rust-toolchain.toml so
-      # the Rust compiler version exactly matches what Vercel uses internally.
-      - name: Setup Rust (use repo-pinned toolchain)
-        uses: dtolnay/rust-toolchain@stable
+      # Next.js v16 uses nightly Rust features (e.g. tokio's disable_lifo_slot).
+      # DO NOT use dtolnay/rust-toolchain@stable — it overrides rust-toolchain.toml.
+      # Instead, run `rustup show` which reads the repo's rust-toolchain.toml and
+      # installs the exact pinned nightly toolchain Vercel uses to build SWC.
+      - name: Setup Rust from repo rust-toolchain.toml (nightly pinned)
+        run: |
+          echo "=== rust-toolchain.toml ==="
+          cat rust-toolchain.toml 2>/dev/null || cat rust-toolchain 2>/dev/null || echo "(no toolchain file found)"
+          # This triggers automatic install of the pinned toolchain
+          rustup show
+          echo "Active toolchain: $(rustup show active-toolchain)"
 
       - name: Add Android ARM64 target to active toolchain
-        run: rustup target add aarch64-linux-android
+        run: |
+          TOOLCHAIN=$(rustup show active-toolchain | awk '{print $1}')
+          echo "Adding aarch64-linux-android to toolchain: $TOOLCHAIN"
+          rustup target add aarch64-linux-android --toolchain "$TOOLCHAIN"
+          rustup target list --installed
 
       # ── Android NDK ───────────────────────────────────────────────────────
       # NDK r27 ships clang 18 and supports API 24+ (Android 7+).
