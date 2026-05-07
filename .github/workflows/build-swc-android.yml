@@ -81,6 +81,32 @@ jobs:
           echo "=== napi dependency in packages/next-swc/Cargo.toml ==="
           grep -A5 'napi' packages/next-swc/Cargo.toml | head -40 || true
 
+      # ── Patch .cargo/config.toml for Android build ────────────────────────
+      # WHY: Setting RUSTFLAGS env var completely OVERRIDES rustflags in
+      # .cargo/config.toml. Next.js already sets --cfg tokio_unstable there
+      # (required for tokio's disable_lifo_slot API). Instead of fighting env vars,
+      # we patch the cargo config directly to ADD the Android linker flag.
+      # This preserves the existing --cfg tokio_unstable and adds --hash-style=gnu.
+      - name: Patch .cargo/config.toml for Android linker flags
+        run: |
+          echo "=== Original .cargo/config.toml ==="
+          cat .cargo/config.toml 2>/dev/null || echo "(no .cargo/config.toml)"
+
+          # Append Android-specific target rustflags.
+          # The [build] section already has --cfg tokio_unstable.
+          # We add a [target.aarch64-linux-android] section for the linker flag.
+          cat >> .cargo/config.toml << 'EOF'
+
+          [target.aarch64-linux-android]
+          rustflags = [
+            "-C", "link-arg=-Wl,--hash-style=gnu"
+          ]
+          EOF
+
+          echo ""
+          echo "=== Patched .cargo/config.toml ==="
+          cat .cargo/config.toml
+
       # ── Build ─────────────────────────────────────────────────────────────
       - name: Build next-swc-napi for aarch64-linux-android
         env:
@@ -96,10 +122,9 @@ jobs:
           # Suppress OpenSSL/OTEL noise during compilation
           OPENSSL_NO_VENDOR: 1
           NEXT_TELEMETRY_DISABLED: 1
-          # Force DT_GNU_HASH into the output binary.
-          # Android's linker REQUIRES DT_HASH or DT_GNU_HASH — some lld configs
-          # omit it entirely, causing "empty/missing DT_HASH/DT_GNU_HASH" at dlopen().
-          RUSTFLAGS: "-C link-arg=-Wl,--hash-style=gnu"
+          # NOTE: We do NOT set RUSTFLAGS here — that would override .cargo/config.toml
+          # and silently drop --cfg tokio_unstable (needed for disable_lifo_slot).
+          # The --hash-style=gnu linker flag is set via .cargo/config.toml above.
         run: |
           cd packages/next-swc
           napi build \
@@ -111,6 +136,7 @@ jobs:
             --features plugin,image-extended,tracing/release_max_level_trace \
             --js false \
             native
+
 
       # ── Post-build: inspect raw binary ────────────────────────────────────
       - name: Inspect raw binary (pre-patch)
